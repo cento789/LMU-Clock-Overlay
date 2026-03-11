@@ -10,13 +10,17 @@ import sys
 import os
 import json
 import threading
+import subprocess
 
 from PIL import Image, ImageDraw
 import pystray
 import keyboard
 
 APP_NAME = "LMU Clock Overlay"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
+
+# Process names to detect Le Mans Ultimate
+LMU_PROCESS_NAMES = ["Le Mans Ultimate.exe", "LMU.exe"]
 AUTHOR = "cento789"
 
 DEFAULT_SIZE = 18
@@ -79,6 +83,20 @@ def _create_tray_icon_image(color):
 
 def _time_str(format_24h):
     return datetime.now().strftime("%H:%M:%S") if format_24h else datetime.now().strftime("%I:%M:%S %p")
+
+
+def _is_lmu_running():
+    """Check if Le Mans Ultimate process is running."""
+    try:
+        output = subprocess.check_output(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            text=True, timeout=5,
+        )
+        output_lower = output.lower()
+        return any(name.lower() in output_lower for name in LMU_PROCESS_NAMES)
+    except (subprocess.SubprocessError, OSError):
+        return False
 
 
 class SettingsWindow:
@@ -404,7 +422,9 @@ class ClockOverlay:
         self.pos_x = cfg["pos_x"]
         self.pos_y = cfg["pos_y"]
         self.tray_icon = None
-        self.visible = True
+        self.visible = False  # start hidden, wait for LMU
+        self.lmu_running = False
+        self.user_hidden = False  # tracks manual hide via hotkey
 
         self.root = tk.Tk()
         self.root.title(APP_NAME)
@@ -414,6 +434,7 @@ class ClockOverlay:
         self.root.attributes("-alpha", self.opacity)
         self.root.configure(bg="#000000")
         self.root.geometry(f"+{self.pos_x}+{self.pos_y}")
+        self.root.withdraw()  # start hidden
 
         self._drag_data = {"x": 0, "y": 0}
 
@@ -431,6 +452,7 @@ class ClockOverlay:
 
         self._bind_all()
         self._update_clock()
+        self._check_lmu()
 
         keyboard.add_hotkey(HOTKEY, self._toggle_visibility)
 
@@ -460,9 +482,46 @@ class ClockOverlay:
     def _do_toggle(self):
         if self.visible:
             self.root.withdraw()
+            self.visible = False
+            self.user_hidden = True
         else:
+            if self.lmu_running:
+                self.root.deiconify()
+                self.visible = True
+            self.user_hidden = False
+
+    def _check_lmu(self):
+        """Periodically check if LMU is running and show/hide overlay."""
+        def _poll():
+            was_running = self.lmu_running
+            self.lmu_running = _is_lmu_running()
+
+            if self.lmu_running and not was_running:
+                if not self.user_hidden:
+                    self.root.after(0, self._show_overlay)
+                self._update_tray_tooltip("LMU detected - overlay active")
+            elif not self.lmu_running and was_running:
+                self.root.after(0, self._hide_overlay)
+                self._update_tray_tooltip("Waiting for Le Mans Ultimate...")
+
+            self.root.after(3000, _poll)
+
+        self._update_tray_tooltip("Waiting for Le Mans Ultimate...")
+        self.root.after(1000, _poll)
+
+    def _show_overlay(self):
+        if not self.visible:
             self.root.deiconify()
-        self.visible = not self.visible
+            self.visible = True
+
+    def _hide_overlay(self):
+        if self.visible:
+            self.root.withdraw()
+            self.visible = False
+
+    def _update_tray_tooltip(self, text):
+        if self.tray_icon:
+            self.tray_icon.title = text
 
     def _update_clock(self):
         self.time_label.set_text(_time_str(self.format_24h))
@@ -487,69 +546,9 @@ class ClockOverlay:
             pystray.MenuItem("Show/Hide  (Ctrl+Shift+H)", lambda: self._toggle_visibility()),
             pystray.MenuItem("Quit", lambda: self.root.after(0, self._quit)),
         )
-        self.tray_icon = pystray.Icon(APP_NAME, icon_image, APP_NAME, menu)
-        threading.Thread(target=self.tray_icon.run, daemon=True).start()
-
-    def run(self):
-        self._setup_tray()
-        self.root.mainloop()
-
-
-if __name__ == "__main__":
-    if "--version" in sys.argv:
-        print(f"{APP_NAME} v{APP_VERSION} by {AUTHOR}")
-        sys.exit(0)
-
-    cfg = _load_config()
-    settings = SettingsWindow(cfg)
-    result = settings.run()
-
-    if result:
-        cfg.update(result)
-        _save_config(cfg)
-        overlay = ClockOverlay(cfg)
-        overlay.run()
-
-    def _on_drag_end(self, _event):
-        self.pos_x = self.root.winfo_x()
-        self.pos_y = self.root.winfo_y()
-
-    def _toggle_visibility(self):
-        self.root.after(0, self._do_toggle)
-
-    def _do_toggle(self):
-        if self.visible:
-            self.root.withdraw()
-        else:
-            self.root.deiconify()
-        self.visible = not self.visible
-
-    def _update_clock(self):
-        now = datetime.now()
-        self.time_label.config(text=now.strftime("%H:%M:%S"))
-        if self.show_date:
-            self.date_label.config(text=now.strftime("%d/%m/%Y"))
-        self.root.after(200, self._update_clock)
-
-    def _quit(self):
-        # Save position and settings before exit
-        self.cfg["pos_x"] = self.pos_x
-        self.cfg["pos_y"] = self.pos_y
-        _save_config(self.cfg)
-        keyboard.unhook_all()
-        if self.tray_icon:
-            self.tray_icon.stop()
-        self.root.destroy()
-
-    def _setup_tray(self):
-        icon_image = _create_tray_icon_image(self.color)
-        menu = pystray.Menu(
-            pystray.MenuItem(f"{APP_NAME} v{APP_VERSION}", None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Show/Hide  (Ctrl+Shift+H)", lambda: self._toggle_visibility()),
-            pystray.MenuItem("Quit", lambda: self.root.after(0, self._quit)),
+        self.tray_icon = pystray.Icon(
+            APP_NAME, icon_image, "Waiting for Le Mans Ultimate...", menu
         )
-        self.tray_icon = pystray.Icon(APP_NAME, icon_image, APP_NAME, menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
     def run(self):
